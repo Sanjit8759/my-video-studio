@@ -3,6 +3,8 @@ package com.myvideostudio.app
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.content.Intent
 import android.content.ContentValues
 import android.net.Uri
@@ -14,58 +16,69 @@ import android.view.Gravity
 import android.widget.*
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.Transformer
 import java.io.File
 
+@OptIn(UnstableApi::class)
 class MainActivity : Activity() {
+
+    data class Clip(val start: Long, val end: Long)
 
     private var player: ExoPlayer? = null
     private var selectedUri: Uri? = null
     private var duration = 0L
 
-    private var startTime = 0L
-    private var endTime = 0L
+    private val clips = mutableListOf<Clip>()
+    private var selectedClip = -1
 
-    private lateinit var startSeek: SeekBar
-    private lateinit var endSeek: SeekBar
-    private lateinit var startText: TextView
-    private lateinit var endText: TextView
+    private lateinit var timeline: SeekBar
+    private lateinit var positionText: TextView
+    private lateinit var clipList: LinearLayout
     private lateinit var status: TextView
+    private lateinit var deleteButton: Button
+
+    private val handler = Handler(Looper.getMainLooper())
 
     private val bg = Color.rgb(14, 18, 29)
     private val accent = Color.rgb(0, 190, 160)
     private val panel = Color.rgb(29, 37, 54)
 
-    private fun dp(v: Int): Int =
+    private fun dp(v: Int) =
         (v * resources.displayMetrics.density).toInt()
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        showHome()
+    private fun time(ms: Long): String {
+        val s = ms.coerceAtLeast(0) / 1000
+        return String.format("%02d:%02d", s / 60, s % 60)
     }
 
-    private fun button(text: String, action: () -> Unit): Button {
-        return Button(this).apply {
-            this.text = text
-            setTextColor(Color.WHITE)
-            setBackgroundColor(panel)
-            setOnClickListener { action() }
-        }
-    }
-
-    private fun label(text: String, size: Float = 16f): TextView {
-        return TextView(this).apply {
-            this.text = text
+    private fun label(t: String, size: Float = 17f) =
+        TextView(this).apply {
+            text = t
             textSize = size
             setTextColor(Color.WHITE)
             setPadding(0, dp(8), 0, dp(8))
         }
+
+    private fun button(t: String, action: () -> Unit) =
+        Button(this).apply {
+            text = t
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(panel)
+            setOnClickListener { action() }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        showHome()
     }
 
     private fun showHome() {
@@ -78,11 +91,7 @@ class MainActivity : Activity() {
             setBackgroundColor(bg)
         }
 
-        root.addView(TextView(this).apply {
-            text = "MY VIDEO STUDIO"
-            textSize = 27f
-            setTextColor(accent)
-        })
+        root.addView(label("MY VIDEO STUDIO", 27f))
 
         root.addView(button("＋ NEW PROJECT") {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -108,21 +117,29 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun time(ms: Long): String {
-        val seconds = ms / 1000
-        return String.format(
-            "%02d:%02d",
-            seconds / 60,
-            seconds % 60
-        )
+    private val updateTimeline = object : Runnable {
+        override fun run() {
+            val p = player
+            if (p != null && duration > 0) {
+                val pos = p.currentPosition.coerceIn(0, duration)
+                timeline.progress = (pos * 10000 / duration).toInt()
+                positionText.text =
+                    "POSITION: ${time(pos)} / ${time(duration)}"
+            }
+            handler.postDelayed(this, 300)
+        }
     }
 
     private fun openEditor(uri: Uri) {
         selectedUri = uri
+        clips.clear()
+        selectedClip = -1
+
         player?.release()
 
-        val scroll = ScrollView(this)
-        scroll.setBackgroundColor(bg)
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(bg)
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -132,16 +149,12 @@ class MainActivity : Activity() {
 
         scroll.addView(root)
 
-        root.addView(label("MY VIDEO STUDIO", 23f))
-
-        root.addView(button("← BACK") {
-            showHome()
-        })
+        root.addView(label("MY VIDEO STUDIO", 24f))
+        root.addView(button("← BACK") { showHome() })
 
         val preview = PlayerView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(240)
+                -1, dp(250)
             )
             useController = true
             setBackgroundColor(Color.BLACK)
@@ -149,124 +162,122 @@ class MainActivity : Activity() {
 
         root.addView(preview)
 
-        root.addView(label("✂ TRIM VIDEO", 22f))
+        root.addView(label("VIDEO TIMELINE", 21f))
 
-        startText = label("START: 00:00")
-        root.addView(startText)
+        positionText = label("POSITION: 00:00 / 00:00")
+        root.addView(positionText)
 
-        startSeek = SeekBar(this).apply {
-            max = 1000
+        timeline = SeekBar(this).apply {
+            max = 10000
             progress = 0
         }
-        root.addView(startSeek)
 
-        endText = label("END: 00:00")
-        root.addView(endText)
+        root.addView(timeline)
 
-        endSeek = SeekBar(this).apply {
-            max = 1000
-            progress = 1000
+        timeline.setOnSeekBarChangeListener(
+            object : SeekBar.OnSeekBarChangeListener {
+
+                override fun onProgressChanged(
+                    seekBar: SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean
+                ) {
+                    if (fromUser && duration > 0) {
+                        val pos = duration * progress / 10000
+                        positionText.text =
+                            "POSITION: ${time(pos)} / ${time(duration)}"
+                    }
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    if (duration > 0) {
+                        player?.seekTo(
+                            duration * (seekBar?.progress ?: 0) / 10000
+                        )
+                    }
+                }
+            }
+        )
+
+        root.addView(label("✂ CUT / SPLIT VIDEO", 21f))
+
+        root.addView(label(
+            "1. Play the video\n" +
+            "2. Pause where you want to cut\n" +
+            "3. Press SPLIT\n" +
+            "4. Select unwanted clip and DELETE"
+        ))
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
         }
-        root.addView(endSeek)
 
-        status = label("Select the start and end points.")
+        actions.addView(
+            button("✂ SPLIT") { splitClip() },
+            LinearLayout.LayoutParams(0, dp(60), 1f)
+        )
+
+        deleteButton = button("DELETE CLIP") {
+            deleteClip()
+        }
+
+        actions.addView(
+            deleteButton,
+            LinearLayout.LayoutParams(0, dp(60), 1f)
+        )
+
+        root.addView(actions)
+
+        root.addView(label("YOUR VIDEO CLIPS", 20f))
+
+        clipList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        root.addView(clipList)
+
+        status = label("Loading video...")
         root.addView(status)
 
-        startSeek.setOnSeekBarChangeListener(
-            object : SeekBar.OnSeekBarChangeListener {
-
-                override fun onProgressChanged(
-                    seekBar: SeekBar?,
-                    progress: Int,
-                    fromUser: Boolean
-                ) {
-                    if (fromUser && duration > 0) {
-                        startTime = duration * progress / 1000
-
-                        if (startTime >= endTime) {
-                            startTime = (endTime - 500).coerceAtLeast(0)
-                        }
-
-                        startText.text =
-                            "START: ${time(startTime)}"
-                    }
-                }
-
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        root.addView(button("RESET ALL CUTS") {
+            if (duration > 0) {
+                clips.clear()
+                clips.add(Clip(0, duration))
+                selectedClip = 0
+                refreshClips()
+                status.text = "All cuts reset."
             }
-        )
-
-        endSeek.setOnSeekBarChangeListener(
-            object : SeekBar.OnSeekBarChangeListener {
-
-                override fun onProgressChanged(
-                    seekBar: SeekBar?,
-                    progress: Int,
-                    fromUser: Boolean
-                ) {
-                    if (fromUser && duration > 0) {
-                        endTime = duration * progress / 1000
-
-                        if (endTime <= startTime) {
-                            endTime =
-                                (startTime + 500).coerceAtMost(duration)
-                        }
-
-                        endText.text =
-                            "END: ${time(endTime)}"
-                    }
-                }
-
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-            }
-        )
-
-        root.addView(button("RESET TRIM") {
-            startTime = 0
-            endTime = duration
-
-            startSeek.progress = 0
-            endSeek.progress = 1000
-
-            startText.text = "START: 00:00"
-            endText.text = "END: ${time(duration)}"
-
-            status.text = "Trim reset."
         })
 
-        root.addView(button("✂ TRIM & EXPORT VIDEO") {
+        root.addView(button("EXPORT FINAL VIDEO") {
             exportVideo()
         })
-
-        root.addView(label("NEXT: CUT • SPLIT • CROP • MUSIC • TEXT"))
 
         setContentView(scroll)
 
         player = ExoPlayer.Builder(this).build().also { exo ->
 
             preview.player = exo
-
             exo.setMediaItem(MediaItem.fromUri(uri))
 
             exo.addListener(object : Player.Listener {
 
                 override fun onPlaybackStateChanged(state: Int) {
                     if (state == Player.STATE_READY) {
-
                         duration = exo.duration.coerceAtLeast(0)
 
-                        startTime = 0
-                        endTime = duration
+                        clips.clear()
 
-                        startSeek.progress = 0
-                        endSeek.progress = 1000
+                        if (duration > 0) {
+                            clips.add(Clip(0, duration))
+                            selectedClip = 0
+                        }
 
-                        startText.text = "START: 00:00"
-                        endText.text = "END: ${time(duration)}"
-
-                        status.text = "Video ready. Choose trim points."
+                        refreshClips()
+                        status.text = "Video ready. Play and pause to split."
                     }
                 }
             })
@@ -274,97 +285,188 @@ class MainActivity : Activity() {
             exo.prepare()
             exo.playWhenReady = false
         }
+
+        handler.removeCallbacks(updateTimeline)
+        handler.post(updateTimeline)
     }
 
-    private fun exportVideo() {
+    private fun splitClip() {
+        val pos = player?.currentPosition ?: 0L
 
-        val uri = selectedUri
+        val index = clips.indexOfFirst {
+            pos > it.start + 100 &&
+            pos < it.end - 100
+        }
 
-        if (uri == null || duration <= 0) {
-            status.text = "Video is not ready. Please wait."
+        if (index < 0) {
+            status.text = "Pause inside a clip before splitting."
             return
         }
 
-        if (endTime - startTime < 500) {
-            status.text = "Select at least 0.5 seconds."
+        val old = clips[index]
+
+        clips[index] = Clip(old.start, pos)
+        clips.add(index + 1, Clip(pos, old.end))
+
+        selectedClip = index + 1
+
+        refreshClips()
+        status.text = "Split successful! Two clips created."
+    }
+
+    private fun deleteClip() {
+        if (selectedClip !in clips.indices) {
+            status.text = "Select a clip first."
+            return
+        }
+
+        if (clips.size <= 1) {
+            status.text = "At least one clip must remain."
+            return
+        }
+
+        clips.removeAt(selectedClip)
+
+        selectedClip = selectedClip.coerceAtMost(clips.lastIndex)
+
+        refreshClips()
+        status.text = "Selected clip deleted."
+    }
+
+    private fun refreshClips() {
+        clipList.removeAllViews()
+
+        clips.forEachIndexed { index, clip ->
+
+            val item = Button(this).apply {
+                text =
+                    "${if (selectedClip == index) "▶ " else ""}" +
+                    "CLIP ${index + 1}   " +
+                    "${time(clip.start)} - ${time(clip.end)}"
+
+                setTextColor(Color.WHITE)
+
+                setBackgroundColor(
+                    if (selectedClip == index)
+                        Color.rgb(0, 115, 100)
+                    else panel
+                )
+
+                setOnClickListener {
+                    selectedClip = index
+
+                    player?.seekTo(clip.start)
+
+                    if (duration > 0) {
+                        timeline.progress =
+                            (clip.start * 10000 / duration).toInt()
+                    }
+
+                    refreshClips()
+
+                    status.text = "Clip ${index + 1} selected."
+                }
+            }
+
+            clipList.addView(item)
+        }
+
+        deleteButton.isEnabled =
+            clips.size > 1 && selectedClip in clips.indices
+    }
+
+    private fun exportVideo() {
+        val uri = selectedUri
+
+        if (uri == null || clips.isEmpty()) {
+            status.text = "No clips available."
             return
         }
 
         player?.pause()
 
-        status.text = "Exporting video. Please wait..."
+        status.text = "Exporting final video..."
 
         val output = File(
             cacheDir,
-            "trimmed_${System.currentTimeMillis()}.mp4"
+            "final_${System.currentTimeMillis()}.mp4"
         )
 
-        val clipping =
-            MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionMs(startTime)
-                .setEndPositionMs(endTime)
+        val items = clips.map { clip ->
+
+            val clipping =
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(clip.start)
+                    .setEndPositionMs(clip.end)
+                    .build()
+
+            val media = MediaItem.Builder()
+                .setUri(uri)
+                .setClippingConfiguration(clipping)
                 .build()
 
-        val mediaItem = MediaItem.Builder()
-            .setUri(uri)
-            .setClippingConfiguration(clipping)
-            .build()
-
-        val editedItem =
-            EditedMediaItem.Builder(mediaItem).build()
-
-        val transformer =
-            Transformer.Builder(this)
-                .addListener(object : Transformer.Listener {
-
-                    override fun onCompleted(
-                        composition: Composition,
-                        exportResult: ExportResult
-                    ) {
-                        runOnUiThread {
-                            try {
-                                val saved = saveVideo(output)
-
-                                status.text =
-                                    if (saved != null) {
-                                        "SUCCESS! Saved in Movies/MY VIDEO STUDIO."
-                                    } else {
-                                        "Export complete, but saving failed."
-                                    }
-
-                                Toast.makeText(
-                                    this@MainActivity,
-                                    "Video Export Complete",
-                                    Toast.LENGTH_LONG
-                                ).show()
-
-                            } catch (e: Exception) {
-                                status.text = "Save error: ${e.message}"
-                            }
-                        }
-                    }
-
-                    override fun onError(
-                        composition: Composition,
-                        exportResult: ExportResult,
-                        exportException: ExportException
-                    ) {
-                        runOnUiThread {
-                            status.text =
-                                "Export failed: ${exportException.message}"
-                        }
-                    }
-                })
-                .build()
+            EditedMediaItem.Builder(media).build()
+        }
 
         try {
-            transformer.start(editedItem, output.absolutePath)
+            val sequence =
+                EditedMediaItemSequence.withAudioAndVideoFrom(items)
+
+            val composition =
+                Composition.Builder(sequence).build()
+
+            val transformer =
+                Transformer.Builder(this)
+                    .addListener(object : Transformer.Listener {
+
+                        override fun onCompleted(
+                            composition: Composition,
+                            exportResult: ExportResult
+                        ) {
+                            runOnUiThread {
+                                try {
+                                    val saved = saveVideo(output)
+
+                                    status.text =
+                                        if (saved != null)
+                                            "SUCCESS! Video saved in Movies/MY VIDEO STUDIO."
+                                        else
+                                            "Export completed but save failed."
+
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "Video Export Complete",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+
+                                } catch (e: Exception) {
+                                    status.text = "Save error: ${e.message}"
+                                }
+                            }
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            runOnUiThread {
+                                status.text =
+                                    "Export failed: ${exportException.message}"
+                            }
+                        }
+                    })
+                    .build()
+
+            transformer.start(composition, output.absolutePath)
+
         } catch (e: Exception) {
             status.text = "Export error: ${e.message}"
         }
     }
 
     private fun saveVideo(source: File): Uri? {
+        if (!source.exists()) return null
 
         if (Build.VERSION.SDK_INT >= 29) {
 
@@ -373,10 +475,7 @@ class MainActivity : Activity() {
                     MediaStore.Video.Media.DISPLAY_NAME,
                     "MY_VIDEO_STUDIO_${System.currentTimeMillis()}.mp4"
                 )
-                put(
-                    MediaStore.Video.Media.MIME_TYPE,
-                    "video/mp4"
-                )
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(
                     MediaStore.Video.Media.RELATIVE_PATH,
                     Environment.DIRECTORY_MOVIES +
@@ -418,7 +517,6 @@ class MainActivity : Activity() {
             )
 
             source.copyTo(destination, overwrite = true)
-
             return Uri.fromFile(destination)
         }
     }
@@ -432,7 +530,6 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
 
         if (requestCode == 100 && resultCode == RESULT_OK) {
-
             val uri = data?.data
 
             if (uri != null) {
@@ -449,6 +546,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(updateTimeline)
         player?.release()
         player = null
         super.onDestroy()
